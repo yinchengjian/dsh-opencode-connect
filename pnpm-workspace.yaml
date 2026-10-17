@@ -1,0 +1,12 @@
+# pnpm 11 config. pnpm 11 refuses to run scripts (and to let `pnpm run <script>`
+# proceed past its dependency check) unless the packages that need build steps
+# are explicitly listed. Without this file pnpm auto-generates a placeholder,
+# and `pnpm run check` fails with ERR_PNPM_IGNORED_BUILDS before reaching a
+# single test.
+#
+# Both entries are transitive dependencies of @earendil-works/pi-ai (via
+# @google/genai and protobufjs). Neither script is needed at runtime — allowing
+# them is what keeps a plain `pnpm install` and `pnpm run check` working.
+allowBuilds:
+  '@google/genai': true
+  protobufjs: true

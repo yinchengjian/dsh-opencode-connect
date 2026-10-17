@@ -1,0 +1,12 @@
+# Register the OpenCode provider without changing the profile's current
+# default model. The plugin streams the OpenCode anonymous free lane directly;
+# no API key, no sign-in, no child process, and no local port.
+#
+# Outbound traffic must reach opencode.ai and models.dev. The free lane
+# rate-limits per egress IP, so a shared/proxied exit will answer 429 where a
+# clean residential exit answers 200 — route opencode.ai DIRECT if needed:
+#
+#   - DOMAIN-SUFFIX,opencode.ai,DIRECT
+- insert:
+    - id: llm-opencode
+      name: dsh-opencode-connect
