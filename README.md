@@ -97,6 +97,18 @@ https://opencode.ai/zen/v1           ← Authorization: Bearer public
 | `403 FreeTierError` | 请求形状被拒。若你改过 `src/ids.ts` 或 `src/shim.ts`，多半是破坏了伪装头/body 形状；`npm test` 会钉住这些不变量 |
 | 模型列表为空 | 首次刷新需要网络。检查 `opencode.ai` 与 `models.dev` 可达性；日志会打印 `live=N, metadata=N` |
 | 只有静态那几个模型 | 刷新未完成（网络未就绪或被拦），保留的是 S3 名单，属预期降级 |
+| 报「已达到输出 token 上限，回答被截断」且回答为空 | 这是 always-think 模型的思考吃光了输出预算，不是配置问题。插件已内置恢复：检测到「只有推理、没有正文、`finish: length`」会自动关掉思考重试一次。若仍出现，把该会话的推理强度调低或选 `off` |
+
+## 推理模型与输出预算
+
+免费通道里有几个 always-think 模型：它们先吐 `reasoning_content`，且这段思考**和正文共用同一个输出预算**。预算偏小时思考会把预算吃光，正文一个 token 都没有，流以 `finish: length` 结束——DSH 会显示「已达到输出 token 上限」。
+
+插件对此做了两件事：
+
+1. **始终提供 `off` 档位**，即使 models.dev 没声明（它只给 `low|high|max`）。实测发现 `off` 必须映射成**不发送** `reasoning_effort` 字段：显式发 `none` 仍会让模型思考，发字面量 `off` 是 422。
+2. **自动恢复**：若一次尝试只有推理、没有正文且以 `max-tokens` 结束，自动以关闭思考重试一次，并把两次的 usage 合并上报。
+
+`defaultMaxTokens` 取自 models.dev 的 `limit.output`（缺省 32768），写入时会被当作该模型的默认输出上限。
 
 ## 安全性
 

@@ -28,11 +28,13 @@ import type {
   PreparedAdapterCall,
   ResolvedRetryPolicy,
   StreamChunk,
+  TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, type FreeModel } from './catalog.ts'
 import { toPiContext, type HarnessGenerateOptions } from './messages.ts'
 import { toStreamChunks } from './events.ts'
 import type { OpenCodeShim } from './shim.ts'
+import { reasoningEffortWire, shouldRecoverFromReasoningTruncation } from './reasoning.ts'
 
 /** Provider route this bundle owns. */
 export const OPENCODE_PROVIDER = 'opencode'
@@ -77,13 +79,22 @@ function modelMetadata(model: FreeModel): Omit<LlmResolvedModelInfo, 'provider' 
 
 /** Project one advertised model into pi-ai's model shape. */
 function catalogModel(model: FreeModel, baseUrl: string, providerId: string): Model<Api> {
+  const reasoning = model.reasoningEfforts !== undefined
   return {
     id: model.id,
     name: model.name,
     api: OPENCODE_API,
     provider: providerId,
     baseUrl,
-    reasoning: model.reasoningEfforts !== undefined,
+    reasoning,
+    // pi-ai spells "stop thinking" as the ABSENCE of `reasoning_effort`
+    // (`omitWhenOff`). Mapping `off` to the literal "none" is NOT enough here:
+    // the gateway accepts "none" but it still lets an always-think model think,
+    // and "off" is a hard 422. Omitting the field is the only shape that
+    // reliably stops the reasoning phase from consuming the answer budget.
+    ...(reasoning
+      ? { thinkingLevelMap: { off: { $var: 'thinking.effort', omitWhenOff: true } as never } }
+      : {}),
     input: [...model.inputModalities],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: model.contextWindow,
@@ -216,38 +227,91 @@ class OpenCodePiAiAdapter extends LlmAdapter {
   override async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const request = options as unknown as HarnessGenerateOptions
     const known = this.#find(request.model)
-    const model = catalogModel(
-      known ?? {
-        id: request.model,
-        name: request.model,
-        contextWindow: DEFAULT_CONTEXT_WINDOW,
-        maxOutput: DEFAULT_MAX_OUTPUT,
-        inputModalities: ['text'],
-      },
-      this.#shim.baseUrl() + '/v1',
-      this.#providerId,
-    )
-
-    const context = toPiContext(request, this.#providerId)
-    const streamOptions: Record<string, unknown> = {
-      apiKey: this.#shim.token(),
-      maxRetries: 0,
-      // The harness attribution rides THIS request — the adapter-to-shim hop.
-      // The host contract requires it on every provider request, and the shim
-      // is this route's provider endpoint. The shim then strips it: what leaves
-      // for OpenCode carries only the CLI identity the free lane admits, since
-      // a `deepseek-harness/` token is refused there with 403 FreeTierError.
-      // Stamped explicitly because this adapter drives pi-ai directly rather
-      // than through `PiAiAdapter`, which is where the host normally adds it.
-      headers: attributionHeaders(),
+    const freeModel = known ?? {
+      id: request.model,
+      name: request.model,
+      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      maxOutput: DEFAULT_MAX_OUTPUT,
+      inputModalities: ['text'] as const,
     }
-    if (request.signal !== undefined) streamOptions['signal'] = request.signal
-    if (request.temperature !== undefined) streamOptions['temperature'] = request.temperature
-    if (request.maxTokens !== undefined) streamOptions['maxTokens'] = request.maxTokens
-    if (request.reasoningEffort !== undefined) streamOptions['reasoning'] = request.reasoningEffort
+    const model = catalogModel(freeModel, this.#shim.baseUrl() + '/v1', this.#providerId)
+    const context = toPiContext(request, this.#providerId)
+    // Only a model that advertises `off` can be asked to stop thinking, which
+    // is the sole in-band recovery from a reasoning-only truncation.
+    const canDisableThinking = freeModel.reasoningEfforts?.includes('off') === true
 
-    const events = this.#provider.streamSimple(model, normalizeContext(context), streamOptions as never)
-    yield* toStreamChunks(toPiEvents(events))
+    let priorUsage: TokenUsage | undefined
+    let indexOffset = 0
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const effort = attempt === 0 ? request.reasoningEffort : 'off'
+      const streamOptions: Record<string, unknown> = {
+        apiKey: this.#shim.token(),
+        maxRetries: 0,
+        // The harness attribution rides THIS request — the adapter-to-shim hop.
+        // The host contract requires it on every provider request, and the shim
+        // is this route's provider endpoint. The shim then strips it: what
+        // leaves for OpenCode carries only the CLI identity the free lane
+        // admits, since a `deepseek-harness/` token is refused there with 403
+        // FreeTierError. Stamped explicitly because this adapter drives pi-ai
+        // directly rather than through `PiAiAdapter`, which is where the host
+        // normally adds it.
+        headers: attributionHeaders(),
+      }
+      if (request.signal !== undefined) streamOptions['signal'] = request.signal
+      if (request.temperature !== undefined) streamOptions['temperature'] = request.temperature
+      if (request.maxTokens !== undefined) streamOptions['maxTokens'] = request.maxTokens
+      // `off` must travel as the wire value `none`: the gateway validates the
+      // field, and omitting it keeps the provider default of still thinking.
+      const wireEffort = reasoningEffortWire(effort)
+      if (wireEffort !== undefined) streamOptions['reasoning'] = wireEffort
+
+      const shape = { sawReasoning: false, sawAnswerOrTool: false, finishKind: undefined as string | undefined }
+      const buffered: StreamChunk[] = []
+      let nextIndex = 0
+
+      const events = this.#provider.streamSimple(model, normalizeContext(context), streamOptions as never)
+      for await (const chunk of toStreamChunks(toPiEvents(events))) {
+        observeChunk(chunk, shape)
+        const blockIndex = blockIndexOf(chunk)
+        if (blockIndex !== undefined) nextIndex = Math.max(nextIndex, blockIndex + 1)
+        const shifted = indexOffset === 0 || blockIndex === undefined
+          ? chunk
+          : { ...chunk, index: blockIndex + indexOffset } as StreamChunk
+        if (chunk.type === 'finish') {
+          shape.finishKind = chunk.reason.kind
+          buffered.push(shifted)
+          continue
+        }
+        if (chunk.type === 'usage') {
+          buffered.push(shifted)
+          continue
+        }
+        yield shifted
+      }
+
+      const recover = attempt === 0 && shouldRecoverFromReasoningTruncation({
+        ...shape,
+        canDisableThinking,
+        aborted: request.signal?.aborted === true,
+      })
+      if (recover) {
+        // Keep the first attempt's reasoning visible, but withhold its usage and
+        // terminal finish until the retry settles: replaying a finish would
+        // double-terminate the stream.
+        priorUsage = buffered.find(c => c.type === 'usage')?.usage
+        indexOffset = nextIndex
+        continue
+      }
+
+      const usageChunk = buffered.find(c => c.type === 'usage')
+      if (priorUsage !== undefined || usageChunk !== undefined) {
+        yield { type: 'usage', usage: mergeUsage(priorUsage, usageChunk?.usage) }
+      }
+      const finishChunk = buffered.find(c => c.type === 'finish')
+      if (finishChunk !== undefined) yield finishChunk
+      return
+    }
   }
 }
 
@@ -259,6 +323,82 @@ class OpenCodePiAiAdapter extends LlmAdapter {
  */
 async function* toPiEvents(events: AsyncIterable<unknown>): AsyncGenerator<import('./events.ts').PiEvent> {
   for await (const event of events) yield event as import('./events.ts').PiEvent
+}
+
+/** The block index a chunk carries, when its variant has one. */
+function blockIndexOf(chunk: StreamChunk): number | undefined {
+  return 'index' in chunk && typeof chunk.index === 'number' ? chunk.index : undefined
+}
+
+/** What one attempt delivered, as the recovery predicate reads it. */
+interface AttemptShape {
+  sawReasoning: boolean
+  sawAnswerOrTool: boolean
+  finishKind: string | undefined
+}
+
+/**
+ * Record what an attempt produced so the recovery predicate can judge it.
+ *
+ * A reasoning delta counts as thinking; any text, tool call, or assembled
+ * text/tool block counts as an answer. The distinction is the whole point:
+ * reasoning alone under a token cap means the reply is empty.
+ *
+ * @param chunk - one stream chunk from the harness protocol.
+ * @param shape - mutable accumulator for this attempt.
+ */
+function observeChunk(chunk: StreamChunk, shape: AttemptShape): void {
+  switch (chunk.type) {
+    case 'reasoning-delta':
+      if (chunk.text.length > 0) shape.sawReasoning = true
+      break
+    case 'text-delta':
+      if (chunk.text.length > 0) shape.sawAnswerOrTool = true
+      break
+    case 'tool-call-delta':
+      shape.sawAnswerOrTool = true
+      break
+    case 'block-start':
+      if (chunk.blockType === 'tool-call') shape.sawAnswerOrTool = true
+      break
+    case 'block-end':
+      if (chunk.block.type === 'tool-call') shape.sawAnswerOrTool = true
+      else if (chunk.block.type === 'text' && chunk.block.text.length > 0) shape.sawAnswerOrTool = true
+      else if (chunk.block.type === 'reasoning' && chunk.block.text.length > 0) shape.sawReasoning = true
+      break
+    default:
+      break
+  }
+}
+
+/**
+ * Add the retried attempt's usage to the first attempt's.
+ *
+ * A recovery sends the same prompt twice, so the reported total must charge
+ * both requests or the session under-counts what it spent.
+ *
+ * @param prior - usage from the attempt being retried, when it reported any.
+ * @param current - usage from the settled attempt.
+ * @returns the combined usage.
+ */
+function mergeUsage(prior: TokenUsage | undefined, current: TokenUsage | undefined): TokenUsage {
+  if (prior === undefined) return current ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+  if (current === undefined) return prior
+  const inputTokens = prior.inputTokens + current.inputTokens
+  const outputTokens = prior.outputTokens + current.outputTokens
+  const merged: TokenUsage = {
+    inputTokens,
+    outputTokens,
+    totalTokens: (prior.totalTokens ?? prior.inputTokens + prior.outputTokens)
+      + (current.totalTokens ?? current.inputTokens + current.outputTokens),
+  }
+  const reasoning = (prior.reasoningTokens ?? 0) + (current.reasoningTokens ?? 0)
+  if (reasoning > 0) merged.reasoningTokens = reasoning
+  const cacheRead = (prior.cacheReadTokens ?? 0) + (current.cacheReadTokens ?? 0)
+  if (cacheRead > 0) merged.cacheReadTokens = cacheRead
+  const cacheWrite = (prior.cacheWriteTokens ?? 0) + (current.cacheWriteTokens ?? 0)
+  if (cacheWrite > 0) merged.cacheWriteTokens = cacheWrite
+  return merged
 }
 
 /** Assemble the adapter over a live model list and a running shim. */

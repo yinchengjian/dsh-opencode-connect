@@ -18,6 +18,8 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
+import { reasoningEfforts } from './reasoning.ts'
+
 /** Anonymous-lane base; the OpenAI client appends /chat/completions. */
 export const ZEN_BASE_URL = 'https://opencode.ai/zen'
 
@@ -271,9 +273,13 @@ export function toFreeModel(id: string, metadata: ModelMetadata | undefined): Fr
     maxOutput: metadata?.maxOutput ?? DEFAULT_MAX_OUTPUT,
     inputModalities,
   }
-  if (metadata !== undefined && metadata.reasoning && metadata.effortValues.length > 0) {
-    model.reasoningEfforts = metadata.effortValues
-  }
+  // Advertise the gateway-honored ladder rather than the raw metadata list:
+  // `off` must be offered or a caller cannot stop the thinking that otherwise
+  // eats the whole output budget (see reasoning.ts).
+  const efforts = metadata === undefined
+    ? undefined
+    : reasoningEfforts({ reasoning: metadata.reasoning, effortValues: metadata.effortValues })
+  if (efforts !== undefined) model.reasoningEfforts = efforts
   return model
 }
 

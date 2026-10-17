@@ -230,7 +230,7 @@ export function apply(ctx: Context): void {
 }
 
 export { createOpenCodeAdapter, OPENCODE_PROVIDER } from './adapter.ts'
-export { createOpenCodeShim } from './shim.ts'
+export { createOpenCodeShim, upstreamHeaders, shapeChatBody } from './shim.ts'
 export {
   ZEN_BASE_URL,
   MODELS_DEV_URL,
@@ -240,3 +240,4 @@ export {
   selectFreeModels,
   staticModels,
 } from './catalog.ts'
+export { deriveRequestIDs } from './ids.ts'
