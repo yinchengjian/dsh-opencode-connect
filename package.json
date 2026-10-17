@@ -2,7 +2,7 @@
   "name": "dsh-opencode-connect",
   "displayName": "DSH OpenCode Connect",
   "description": "把 OpenCode 免费模型接入 DeepSeek Harness — bring OpenCode free models into DeepSeek Harness with zero credentials.",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "author": "yinchengjian",
   "keywords": [
     "dsh-plugin",

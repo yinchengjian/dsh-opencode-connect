@@ -22,11 +22,28 @@
 
 ### 2. 安装插件
 
-尚未发布到 npm 或插件市场，从源码安装：
+从 GitHub tag 安装：
+
+```sh
+dsh plugin --profile web add "github:yinchengjian/dsh-opencode-connect#v0.1.2"
+dsh web
+```
+
+首次安装时 pnpm 会拦下 `prepare` 构建脚本，并打印一个以包名起头的 key。把它照抄进**本机**的 profile 配置后重装：
+
+```yaml
+# ~/.dsh/profiles/web/pnpm-workspace.yaml
+allowBuilds:
+  'dsh-opencode-connect@https://codeload.github.com/yinchengjian/dsh-opencode-connect/tar.gz/<commit-sha>': true
+```
+
+`<commit-sha>` 用 pnpm 打印的那一个（每次发版都会变）。这个文件属于你的机器，不要写进插件仓库。
+
+或者从源码本地打包安装：
 
 ```sh
 pnpm install && pnpm build && pnpm pack
-dsh plugin --profile web add ./dsh-opencode-connect-0.1.0.tgz
+dsh plugin --profile web add ./dsh-opencode-connect-<version>.tgz
 dsh web
 ```
 
